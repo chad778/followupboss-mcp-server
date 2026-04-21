@@ -18,7 +18,7 @@ import axios from 'axios';
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'crypto';
 import express from 'express';
 
 // ---------------------------------------------------------------------------
@@ -3054,31 +3054,257 @@ async function startStdio() {
 async function startHttp() {
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const BEARER = process.env.MCP_BEARER_TOKEN;
-  const AUTH_DISABLED = !BEARER || process.env.MCP_AUTH_DISABLED === 'true';
+  const AUTH_PASSWORD = process.env.MCP_AUTH_PASSWORD;
+  const AUTH_DISABLED = process.env.MCP_AUTH_DISABLED === 'true' || (!BEARER && !AUTH_PASSWORD);
+  const OAUTH_ENABLED = !!AUTH_PASSWORD && !AUTH_DISABLED;
+  const ACCESS_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+  const AUTH_CODE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
   if (AUTH_DISABLED) {
-    console.error('WARNING: HTTP transport running without bearer auth. Anyone who knows the URL can call the MCP. Only use on unguessable URLs and behind a VPN or restricted network.');
+    console.error('WARNING: HTTP transport running without auth. Anyone who knows the URL can call the MCP.');
+  } else if (OAUTH_ENABLED) {
+    console.error('HTTP transport running with OAuth 2.1 (DCR + PKCE + password gate).');
+  } else {
+    console.error('HTTP transport running with static bearer token.');
   }
 
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+  app.use(express.urlencoded({ extended: false }));
 
-  // Health endpoint for Railway / Claude connector probe. No auth.
+  // In-memory OAuth state. Railway restarts invalidate everything (re-auth required).
+  const clients = new Map();       // client_id -> { client_secret, redirect_uris, created_at }
+  const authCodes = new Map();     // code       -> { client_id, redirect_uri, code_challenge, expires_at }
+  const accessTokens = new Map();  // token      -> { client_id, expires_at }
+
+  // Periodic cleanup of expired state.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of authCodes) if (v.expires_at < now) authCodes.delete(k);
+    for (const [k, v] of accessTokens) if (v.expires_at < now) accessTokens.delete(k);
+  }, 60 * 1000);
+
+  function baseUrl(req) {
+    // Railway terminates TLS at the edge; x-forwarded-proto carries the real scheme.
+    const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+    return `${proto}://${req.get('host')}`;
+  }
+
+  function esc(str) {
+    return String(str ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+  }
+
+  function constantTimeEq(a, b) {
+    const ab = Buffer.from(String(a));
+    const bb = Buffer.from(String(b));
+    if (ab.length !== bb.length) return false;
+    return timingSafeEqual(ab, bb);
+  }
+
+  // -------------------------------------------------------------------------
+  // Health endpoint (no auth)
+  // -------------------------------------------------------------------------
   app.get('/health', (_req, res) => {
     res.json({
       status: 'ok',
       version: '1.1.1',
       tools: activeTools.length,
       safeMode: FUB_SAFE_MODE,
-      authDisabled: AUTH_DISABLED,
+      authMode: AUTH_DISABLED ? 'none' : (OAUTH_ENABLED ? 'oauth2.1' : 'bearer'),
       ts: new Date().toISOString()
     });
   });
 
-  // Bearer auth middleware — protects every /mcp route (unless AUTH_DISABLED).
+  // -------------------------------------------------------------------------
+  // OAuth 2.1 metadata (RFC 8414). Claude's custom connector reads this to
+  // discover the authorize / token / register endpoints.
+  // -------------------------------------------------------------------------
+  app.get('/.well-known/oauth-authorization-server', (req, res) => {
+    const base = baseUrl(req);
+    res.json({
+      issuer: base,
+      authorization_endpoint: `${base}/oauth/authorize`,
+      token_endpoint: `${base}/oauth/token`,
+      registration_endpoint: `${base}/oauth/register`,
+      response_types_supported: ['code'],
+      grant_types_supported: ['authorization_code'],
+      code_challenge_methods_supported: ['S256'],
+      token_endpoint_auth_methods_supported: ['none'],
+      scopes_supported: ['mcp']
+    });
+  });
+
+  // MCP resource metadata (RFC 9728) — lets clients discover the AS for this resource.
+  app.get('/.well-known/oauth-protected-resource', (req, res) => {
+    const base = baseUrl(req);
+    res.json({
+      resource: `${base}/mcp`,
+      authorization_servers: [base],
+      scopes_supported: ['mcp']
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // OAuth: Dynamic Client Registration (RFC 7591). Claude registers itself
+  // dynamically; we hand back a client_id with no secret (public client).
+  // -------------------------------------------------------------------------
+  app.post('/oauth/register', (req, res) => {
+    if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
+    const redirect_uris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
+    if (!redirect_uris.length) {
+      return res.status(400).json({ error: 'invalid_redirect_uri', error_description: 'redirect_uris is required' });
+    }
+    const client_id = randomBytes(16).toString('hex');
+    const now = Math.floor(Date.now() / 1000);
+    clients.set(client_id, { redirect_uris, created_at: now });
+    res.status(201).json({
+      client_id,
+      client_id_issued_at: now,
+      redirect_uris,
+      grant_types: ['authorization_code'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none',
+      scope: 'mcp'
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // OAuth: Authorization endpoint. GET renders a password form. POST checks
+  // the password, mints an auth code, redirects back to the client.
+  // -------------------------------------------------------------------------
+  app.get('/oauth/authorize', (req, res) => {
+    if (!OAUTH_ENABLED) return res.status(404).send('OAuth disabled');
+    const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
+    const client = clients.get(client_id);
+    if (!client) return res.status(400).send('Invalid client_id');
+    if (!client.redirect_uris.includes(redirect_uri)) return res.status(400).send('redirect_uri not registered');
+    if (response_type !== 'code') return res.status(400).send('Only response_type=code supported');
+    if (code_challenge_method !== 'S256') return res.status(400).send('Only S256 PKCE supported');
+    if (!code_challenge) return res.status(400).send('code_challenge required');
+
+    res.set('Content-Type', 'text/html; charset=utf-8');
+    res.send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Follow Up Boss MCP Authorization</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Arial,sans-serif;background:#0e0e0e;color:#eee;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:10px;padding:28px 32px;width:360px;max-width:90%}
+  h1{font-size:18px;margin:0 0 6px;letter-spacing:-0.01em}
+  p{color:#aaa;font-size:13px;margin:0 0 20px;line-height:1.45}
+  label{display:block;font-size:12px;color:#aaa;margin-bottom:6px;text-transform:uppercase;letter-spacing:0.04em}
+  input[type=password]{width:100%;box-sizing:border-box;background:#111;border:1px solid #333;color:#eee;padding:10px 12px;border-radius:6px;font-size:14px;margin-bottom:18px}
+  input[type=password]:focus{outline:none;border-color:#6aa3ff}
+  button{width:100%;background:#6aa3ff;color:#0a0a0a;border:0;padding:10px;font-size:14px;font-weight:600;border-radius:6px;cursor:pointer}
+  button:hover{background:#8bb8ff}
+  .err{background:#3a1a1a;color:#ff9999;padding:8px 10px;border-radius:4px;font-size:13px;margin-bottom:14px}
+  .meta{margin-top:16px;font-size:11px;color:#666}
+</style></head>
+<body>
+  <form class="card" method="POST" action="/oauth/authorize">
+    <h1>Follow Up Boss MCP</h1>
+    <p>Sign in to authorize <strong>${esc(client_id).slice(0,8)}…</strong> to access your FUB CRM tools.</p>
+    ${req.query.err ? `<div class="err">${esc(req.query.err)}</div>` : ''}
+    <input type="hidden" name="client_id" value="${esc(client_id)}">
+    <input type="hidden" name="redirect_uri" value="${esc(redirect_uri)}">
+    <input type="hidden" name="state" value="${esc(state || '')}">
+    <input type="hidden" name="code_challenge" value="${esc(code_challenge)}">
+    <label for="pw">Password</label>
+    <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
+    <button type="submit">Authorize</button>
+    <div class="meta">This server runs in SAFE MODE${FUB_SAFE_MODE ? '' : ' (disabled)'} — delete operations are blocked.</div>
+  </form>
+</body></html>`);
+  });
+
+  app.post('/oauth/authorize', (req, res) => {
+    if (!OAUTH_ENABLED) return res.status(404).send('OAuth disabled');
+    const { client_id, redirect_uri, state, code_challenge, password } = req.body;
+    const client = clients.get(client_id);
+    if (!client) return res.status(400).send('Invalid client_id');
+    if (!client.redirect_uris.includes(redirect_uri)) return res.status(400).send('redirect_uri not registered');
+
+    if (!password || !constantTimeEq(password, AUTH_PASSWORD)) {
+      const q = new URLSearchParams({
+        client_id, redirect_uri, state: state || '', code_challenge,
+        code_challenge_method: 'S256', response_type: 'code',
+        err: 'Wrong password.'
+      });
+      return res.redirect(`/oauth/authorize?${q.toString()}`);
+    }
+
+    const code = randomBytes(32).toString('hex');
+    authCodes.set(code, {
+      client_id, redirect_uri, code_challenge,
+      expires_at: Date.now() + AUTH_CODE_TTL_MS
+    });
+    const url = new URL(redirect_uri);
+    url.searchParams.set('code', code);
+    if (state) url.searchParams.set('state', state);
+    res.redirect(url.toString());
+  });
+
+  // -------------------------------------------------------------------------
+  // OAuth: Token endpoint. Exchange authorization_code + PKCE verifier for an
+  // access token.
+  // -------------------------------------------------------------------------
+  app.post('/oauth/token', (req, res) => {
+    if (!OAUTH_ENABLED) return res.status(404).json({ error: 'oauth_disabled' });
+    const { grant_type, code, redirect_uri, client_id, code_verifier } = req.body;
+    if (grant_type !== 'authorization_code') return res.status(400).json({ error: 'unsupported_grant_type' });
+    const entry = authCodes.get(code);
+    if (!entry) return res.status(400).json({ error: 'invalid_grant', error_description: 'Unknown code' });
+    if (entry.expires_at < Date.now()) {
+      authCodes.delete(code);
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'Code expired' });
+    }
+    if (entry.client_id !== client_id) return res.status(400).json({ error: 'invalid_grant', error_description: 'client_id mismatch' });
+    if (entry.redirect_uri !== redirect_uri) return res.status(400).json({ error: 'invalid_grant', error_description: 'redirect_uri mismatch' });
+    if (!code_verifier) return res.status(400).json({ error: 'invalid_request', error_description: 'code_verifier required' });
+
+    const expectedChallenge = createHash('sha256').update(code_verifier).digest('base64url');
+    if (expectedChallenge !== entry.code_challenge) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    }
+
+    authCodes.delete(code);
+    const access_token = randomBytes(32).toString('hex');
+    accessTokens.set(access_token, {
+      client_id,
+      expires_at: Date.now() + ACCESS_TOKEN_TTL_MS
+    });
+    res.json({
+      access_token,
+      token_type: 'Bearer',
+      expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+      scope: 'mcp'
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Auth middleware protecting /mcp.
+  // -------------------------------------------------------------------------
+  const wwwAuthenticateHeader = (req) => {
+    const base = baseUrl(req);
+    return `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`;
+  };
+
   const requireAuth = (req, res, next) => {
     if (AUTH_DISABLED) return next();
     const header = req.headers['authorization'] || '';
-    if (!header.startsWith('Bearer ') || header.slice(7).trim() !== BEARER) {
+    if (!header.startsWith('Bearer ')) {
+      res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    const token = header.slice(7).trim();
+    if (OAUTH_ENABLED) {
+      const entry = accessTokens.get(token);
+      if (!entry || entry.expires_at < Date.now()) {
+        res.set('WWW-Authenticate', wwwAuthenticateHeader(req));
+        return res.status(401).json({ error: 'unauthorized' });
+      }
+      return next();
+    }
+    // Static bearer fallback (legacy).
+    if (!constantTimeEq(token, BEARER)) {
       return res.status(401).json({ error: 'unauthorized' });
     }
     next();
