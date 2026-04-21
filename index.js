@@ -99,6 +99,9 @@ async function fubApiWithRetry(method, ...methodArgs) {
 
 async function fubPaginatedGet(path, args = {}) {
   const params = { ...(args || {}) };
+  // Strip our non-FUB flags so they don't get sent as query params.
+  delete params.lean;
+  delete params.verbose;
   const next = params.next;
 
   if (typeof next === 'string' && /^https?:\/\//i.test(next)) {
@@ -122,6 +125,50 @@ async function fubPaginatedGet(path, args = {}) {
   }
 
   return await fubApi.get(path, { params });
+}
+
+// ---------------------------------------------------------------------------
+// Lean response trimming. Mobile Claude chokes on full FUB payloads, so by
+// default we strip heavy/noisy fields from list responses. Pass { verbose: true }
+// (or lean: false) to any list tool to get the raw FUB shape back.
+// ---------------------------------------------------------------------------
+
+const LEAN_FIELDS = {
+  call: ['id', 'created', 'updated', 'personId', 'name', 'phone', 'userId', 'userName', 'duration', 'isIncoming', 'outcome', 'note', 'startedAt'],
+  person: ['id', 'created', 'updated', 'name', 'firstName', 'lastName', 'stage', 'stageId', 'source', 'sourceUrl', 'assignedUserId', 'assignedTo', 'assignedPondId', 'pondId', 'lastActivity', 'lastCommunication', 'contacted', 'contactedTimestamp', 'emails', 'phones', 'tags'],
+  appointment: ['id', 'created', 'title', 'description', 'start', 'end', 'type', 'outcome', 'typeId', 'outcomeId', 'createdById', 'invitees'],
+  task: ['id', 'created', 'name', 'type', 'dueDate', 'dueDateTime', 'isCompleted', 'completed', 'assignedUserId', 'AssignedTo', 'personId'],
+  textMessage: ['id', 'created', 'personId', 'userId', 'userName', 'message', 'fromNumber', 'toNumber', 'isIncoming', 'status'],
+  event: ['id', 'created', 'personId', 'type', 'source', 'message', 'property'],
+  deal: ['id', 'created', 'name', 'stage', 'stageId', 'pipelineId', 'price', 'closeDate', 'assignedUserId', 'assignedTo', 'personIds'],
+  appointmentInvitee: ['userId', 'personId', 'name', 'email']
+};
+
+function trimItem(item, type) {
+  if (!item || typeof item !== 'object') return item;
+  const fields = LEAN_FIELDS[type];
+  if (!fields) return item;
+  const out = {};
+  for (const f of fields) {
+    if (item[f] !== undefined) out[f] = item[f];
+  }
+  // Special case: appointment invitees also need trimming
+  if (type === 'appointment' && Array.isArray(out.invitees)) {
+    out.invitees = out.invitees.map(i => trimItem(i, 'appointmentInvitee'));
+  }
+  return out;
+}
+
+function leanCollection(response, collectionKey, type, args) {
+  const verbose = args && (args.verbose === true || args.lean === false);
+  if (verbose) {
+    return { [collectionKey]: response.data[collectionKey], _metadata: response.data._metadata };
+  }
+  const items = Array.isArray(response.data[collectionKey]) ? response.data[collectionKey] : [];
+  return {
+    [collectionKey]: items.map(i => trimItem(i, type)),
+    _metadata: response.data._metadata
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +280,21 @@ const TOOL_DEFINITIONS = [
       "includeTrash": { "type": "boolean", "description": "Include trashed people" },
       "includeUnclaimed": { "type": "boolean", "description": "Include unclaimed people" },
       "tags": { "type": "string", "description": "Comma-separated tags to filter by" }
+    },
+    "required": []
+  }
+},
+{
+  "name": "listUncontactedLeads",
+  "description": "Voice-friendly convenience tool. Returns recent leads that have NOT been contacted yet, automatically excluding Expireds, FSBOs, and Do Not Contact ponds so you only see workable new leads. Use this for quick daily triage and for picking leads to reassign. Returns compact lean records.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "hours": { "type": "number", "description": "How many hours back to look (default 48)" },
+      "limit": { "type": "number", "description": "Max results (default 25, hard cap 100)" },
+      "assignedUserId": { "type": "number", "description": "Optional: only show leads assigned to this agent" },
+      "assignedPondId": { "type": "number", "description": "Optional: only show leads in this pond" },
+      "excludePondIds": { "type": "array", "items": { "type": "number" }, "description": "Override default exclude list (default [33, 36, 37, 64, 65] = Do Not Contact, Expireds, FSBOs, PA Expireds, PA FSBOs)" }
     },
     "required": []
   }
@@ -2222,7 +2284,7 @@ async function handleToolCall(name, args) {
     // ==================== EVENTS ====================
     case 'listEvents': {
       const response = await fubPaginatedGet('/events', args);
-      return { events: response.data.events, _metadata: response.data._metadata };
+      return leanCollection(response, 'events', 'event', args);
     }
     case 'createEvent': {
       const response = await fubApi.post('/events', args);
@@ -2236,7 +2298,61 @@ async function handleToolCall(name, args) {
     // ==================== PEOPLE ====================
     case 'listPeople': {
       const response = await fubPaginatedGet('/people', args);
-      return { people: response.data.people, _metadata: response.data._metadata };
+      return leanCollection(response, 'people', 'person', args);
+    }
+    case 'listUncontactedLeads': {
+      // Voice-friendly convenience. Pulls recent uncontacted leads, excludes
+      // Expireds/FSBOs/Do-Not-Contact ponds, returns lean records.
+      const hours = typeof args.hours === 'number' && args.hours > 0 ? args.hours : 48;
+      const hardCap = 100;
+      const wanted = Math.min(typeof args.limit === 'number' && args.limit > 0 ? args.limit : 25, hardCap);
+      const defaultExcludes = [33, 36, 37, 64, 65]; // Do Not Contact, Expireds, FSBOs, PA Expireds, PA FSBOs
+      const excludeSet = new Set(Array.isArray(args.excludePondIds) ? args.excludePondIds : defaultExcludes);
+      const cutoff = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+
+      const baseParams = {
+        contacted: false,
+        sort: '-created',
+        includeUnclaimed: true,
+        limit: 100 // page size; we'll paginate until we have enough post-filter
+      };
+      if (typeof args.assignedUserId === 'number') baseParams.assignedUserId = args.assignedUserId;
+      if (typeof args.assignedPondId === 'number') baseParams.assignedPondId = args.assignedPondId;
+
+      const matches = [];
+      let cursor = null;
+      let pagesPulled = 0;
+      const maxPages = 5; // safety: up to 500 candidates scanned
+
+      while (matches.length < wanted && pagesPulled < maxPages) {
+        const pageArgs = { ...baseParams };
+        if (cursor) pageArgs.next = cursor;
+        const response = await fubPaginatedGet('/people', pageArgs);
+        pagesPulled++;
+        const people = response.data.people || [];
+        if (!people.length) break;
+
+        let reachedOlder = false;
+        for (const p of people) {
+          if (p.created && p.created < cutoff) { reachedOlder = true; continue; }
+          if (p.pondId && excludeSet.has(p.pondId)) continue;
+          if (p.assignedPondId && excludeSet.has(p.assignedPondId)) continue;
+          matches.push(trimItem(p, 'person'));
+          if (matches.length >= wanted) break;
+        }
+        if (reachedOlder) break;
+        cursor = response.data._metadata?.next;
+        if (!cursor) break;
+      }
+
+      return {
+        leads: matches,
+        count: matches.length,
+        window_hours: hours,
+        excluded_pond_ids: Array.from(excludeSet),
+        pages_scanned: pagesPulled,
+        notice: matches.length < wanted ? 'Fewer matches than requested — either not enough recent leads or all were filtered out.' : undefined
+      };
     }
     case 'createPerson': {
       const { deduplicate, ...body } = args;
@@ -2352,7 +2468,7 @@ async function handleToolCall(name, args) {
     // ==================== CALLS ====================
     case 'listCalls': {
       const response = await fubPaginatedGet('/calls', args);
-      return { calls: response.data.calls, _metadata: response.data._metadata };
+      return leanCollection(response, 'calls', 'call', args);
     }
     case 'createCall': {
       const response = await fubApi.post('/calls', args);
@@ -2371,7 +2487,7 @@ async function handleToolCall(name, args) {
     // ==================== TEXT MESSAGES ====================
     case 'listTextMessages': {
       const response = await fubPaginatedGet('/textMessages', args);
-      return { textMessages: response.data.textMessages, _metadata: response.data._metadata };
+      return leanCollection(response, 'textMessages', 'textMessage', args);
     }
     case 'createTextMessage': {
       const response = await fubApi.post('/textMessages', args);
@@ -2578,7 +2694,7 @@ async function handleToolCall(name, args) {
     // ==================== TASKS ====================
     case 'listTasks': {
       const response = await fubPaginatedGet('/tasks', args);
-      return { tasks: response.data.tasks, _metadata: response.data._metadata };
+      return leanCollection(response, 'tasks', 'task', args);
     }
     case 'createTask': {
       const response = await fubApi.post('/tasks', args);
@@ -2601,7 +2717,7 @@ async function handleToolCall(name, args) {
     // ==================== APPOINTMENTS ====================
     case 'listAppointments': {
       const response = await fubPaginatedGet('/appointments', args);
-      return { appointments: response.data.appointments, _metadata: response.data._metadata };
+      return leanCollection(response, 'appointments', 'appointment', args);
     }
     case 'createAppointment': {
       const response = await fubApi.post('/appointments', args);
@@ -2720,7 +2836,7 @@ async function handleToolCall(name, args) {
     // ==================== DEALS ====================
     case 'listDeals': {
       const response = await fubPaginatedGet('/deals', args);
-      return { deals: response.data.deals, _metadata: response.data._metadata };
+      return leanCollection(response, 'deals', 'deal', args);
     }
     case 'createDeal': {
       const response = await fubApi.post('/deals', args);

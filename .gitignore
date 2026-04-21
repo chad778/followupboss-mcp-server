@@ -3,3 +3,6 @@ node_modules/
 .env.local
 .DS_Store
 *.log
+.git_token_temp
+auth_and_push.sh
+.railway-secrets-DO-NOT-COMMIT.txt
