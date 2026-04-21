@@ -3054,9 +3054,9 @@ async function startStdio() {
 async function startHttp() {
   const PORT = parseInt(process.env.PORT || '3000', 10);
   const BEARER = process.env.MCP_BEARER_TOKEN;
-  if (!BEARER) {
-    console.error('ERROR: MCP_BEARER_TOKEN is required when MCP_TRANSPORT=http. Set a strong random secret (32+ chars).');
-    process.exit(1);
+  const AUTH_DISABLED = !BEARER || process.env.MCP_AUTH_DISABLED === 'true';
+  if (AUTH_DISABLED) {
+    console.error('WARNING: HTTP transport running without bearer auth. Anyone who knows the URL can call the MCP. Only use on unguessable URLs and behind a VPN or restricted network.');
   }
 
   const app = express();
@@ -3069,12 +3069,14 @@ async function startHttp() {
       version: '1.1.1',
       tools: activeTools.length,
       safeMode: FUB_SAFE_MODE,
+      authDisabled: AUTH_DISABLED,
       ts: new Date().toISOString()
     });
   });
 
-  // Bearer auth middleware — protects every /mcp route.
+  // Bearer auth middleware — protects every /mcp route (unless AUTH_DISABLED).
   const requireAuth = (req, res, next) => {
+    if (AUTH_DISABLED) return next();
     const header = req.headers['authorization'] || '';
     if (!header.startsWith('Bearer ') || header.slice(7).trim() !== BEARER) {
       return res.status(401).json({ error: 'unauthorized' });
