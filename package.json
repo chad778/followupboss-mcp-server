@@ -6,6 +6,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "start:http": "MCP_TRANSPORT=http node index.js",
     "setup": "node setup.js",
     "test": "node test.js"
   },
@@ -27,7 +28,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "express": "^4.19.0"
   },
   "engines": {
     "node": ">=18.0.0"

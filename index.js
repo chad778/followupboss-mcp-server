@@ -12,11 +12,14 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import axios from 'axios';
 import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { randomUUID } from 'crypto';
+import express from 'express';
 
 // ---------------------------------------------------------------------------
 // Load .env file if present (for standalone testing)
@@ -81,6 +84,44 @@ async function fubApiWithRetry(method, ...methodArgs) {
       throw error;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor-safe paginated GET. FUB disables deep offset pagination and requires
+// using the `next` cursor or `nextLink` URL returned in response metadata.
+// This helper accepts args that may contain either:
+//   - `next` as a full URL (nextLink)        -> fetches that URL directly
+//   - `next` as an opaque cursor token       -> passes through as query param
+//   - `offset`/`limit`/anything else         -> passes through as query params
+// It also strips `offset` automatically when a cursor is supplied, so callers
+// can't accidentally mix strategies and trigger a 400.
+// ---------------------------------------------------------------------------
+
+async function fubPaginatedGet(path, args = {}) {
+  const params = { ...(args || {}) };
+  const next = params.next;
+
+  if (typeof next === 'string' && /^https?:\/\//i.test(next)) {
+    // `next` is a full URL (FUB's nextLink). Hit it directly.
+    delete params.next;
+    delete params.offset;
+    return await axios.get(next, {
+      auth: { username: FUB_API_KEY, password: '' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      // Any remaining params override query values on the URL
+      params
+    });
+  }
+
+  if (next) {
+    // `next` is a cursor token. Strip offset to avoid FUB's deep-pagination block.
+    delete params.offset;
+  }
+
+  return await fubApi.get(path, { params });
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +303,9 @@ const TOOL_DEFINITIONS = [
       "addresses": { "type": "array", "description": "Addresses: [{street, city, state, code, type}]", "items": { "type": "object" } },
       "tags": { "type": "array", "description": "Tags", "items": { "type": "string" } },
       "background": { "type": "string", "description": "Background info" },
-      "timeframeId": { "type": "number", "description": "Timeframe ID" }
+      "timeframeId": { "type": "number", "description": "Timeframe ID" },
+      "customLastCallRating": { "type": ["number", "string"], "description": "Custom field: Last Call Rating (1-5 stars). Used by the lead call grader workflow." },
+      "customFields": { "type": "object", "description": "Escape hatch: any additional custom fields on this person. Keys should match the field slug (e.g. customLastCallRating, customSource). Values are set as-is." }
     },
     "required": ["id"]
   }
@@ -296,6 +339,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
     },
@@ -374,6 +418,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "personId": { "type": "number", "description": "Person ID" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
@@ -446,12 +491,14 @@ const TOOL_DEFINITIONS = [
 // ==================== NOTES ====================
 {
   "name": "createNote",
-  "description": "Create a note on a person",
+  "description": "Create a note on a person. Supports @mentioning users via the mentionedUsers array — FUB will send them a notification.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "personId": { "type": "number", "description": "Person ID" },
-      "body": { "type": "string", "description": "Note body/content" },
+      "body": { "type": "string", "description": "Note body/content. If isHtml is true, can include HTML. @mentions require the mentionedUsers array AND the user's name wrapped in the matching FUB mention markup — most reliable path is to simply list user IDs in mentionedUsers and reference them by name in the body." },
+      "isHtml": { "type": "boolean", "description": "Set true if body contains HTML formatting" },
+      "mentionedUsers": { "type": "array", "description": "User IDs to @mention. FUB notifies these users. Used by the lead call grader to mention the agent on coaching notes.", "items": { "type": "number" } },
       "userId": { "type": "number", "description": "User ID who created the note" },
       "createdAt": { "type": "string", "description": "ISO timestamp" }
     },
@@ -666,6 +713,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
     },
@@ -678,6 +726,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "personId": { "type": "number", "description": "Filter by person ID" },
       "actionPlanId": { "type": "number", "description": "Filter by action plan ID" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
@@ -718,6 +767,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
     },
@@ -741,6 +791,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "personId": { "type": "number", "description": "Filter by person" },
       "automationId": { "type": "number", "description": "Filter by automation" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
@@ -942,6 +993,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
     },
@@ -966,6 +1018,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Maximum number of results to return" },
       "offset": { "type": "number", "description": "Offset for pagination" }
     },
@@ -1006,7 +1059,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listCustomFields",
   "description": "List all custom fields",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createCustomField",
@@ -1062,7 +1121,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listStages",
   "description": "List all pipeline stages",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createStage",
@@ -1262,7 +1327,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listAppointmentTypes",
   "description": "List appointment types",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createAppointmentType",
@@ -1314,7 +1385,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listAppointmentOutcomes",
   "description": "List appointment outcomes",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createAppointmentOutcome",
@@ -1366,7 +1443,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listWebhooks",
   "description": "List all webhooks",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createWebhook",
@@ -1431,7 +1514,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listPipelines",
   "description": "List all pipelines",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createPipeline",
@@ -1616,7 +1705,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listDealCustomFields",
   "description": "List deal custom fields",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createDealCustomField",
@@ -1672,12 +1767,24 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listGroups",
   "description": "List all groups",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "listRoundRobinGroups",
   "description": "List round robin groups",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createGroup",
@@ -1731,7 +1838,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listTeams",
   "description": "List all teams",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createTeam",
@@ -1785,14 +1898,26 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listTeamInboxes",
   "description": "List all team inboxes",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 
 // ==================== PONDS ====================
 {
   "name": "listPonds",
   "description": "List all ponds",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 {
   "name": "createPond",
@@ -1844,7 +1969,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listTimeframes",
   "description": "List all timeframes",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 
 // ==================== INBOX APPS ====================
@@ -1953,7 +2084,13 @@ const TOOL_DEFINITIONS = [
 {
   "name": "listInboxAppInstallations",
   "description": "List inbox app installations",
-  "inputSchema": { "type": "object", "properties": {}, "required": [] }
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" }
+    },
+    "required": []
+  }
 },
 
 // ==================== REACTIONS ====================
@@ -2065,6 +2202,7 @@ const TOOL_DEFINITIONS = [
   "inputSchema": {
     "type": "object",
     "properties": {
+      "next": { "type": "string", "description": "Cursor for next page of results" },
       "limit": { "type": "number", "description": "Number of contacts to scan (default 500, max 500)" }
     },
     "required": []
@@ -2083,7 +2221,7 @@ async function handleToolCall(name, args) {
 
     // ==================== EVENTS ====================
     case 'listEvents': {
-      const response = await fubApi.get('/events', { params: args });
+      const response = await fubPaginatedGet('/events', args);
       return { events: response.data.events, _metadata: response.data._metadata };
     }
     case 'createEvent': {
@@ -2097,7 +2235,7 @@ async function handleToolCall(name, args) {
 
     // ==================== PEOPLE ====================
     case 'listPeople': {
-      const response = await fubApi.get('/people', { params: args });
+      const response = await fubPaginatedGet('/people', args);
       return { people: response.data.people, _metadata: response.data._metadata };
     }
     case 'createPerson': {
@@ -2112,9 +2250,15 @@ async function handleToolCall(name, args) {
       return response.data;
     }
     case 'updatePerson': {
-      const { id, mergeTags, ...body } = args;
+      const { id, mergeTags, customFields, ...body } = args;
       const params = mergeTags !== undefined ? { mergeTags } : {};
-      const response = await fubApi.put(`/people/${id}`, body, { params });
+      // Flatten the customFields escape hatch object onto the body so callers can
+      // pass any custom field (e.g. customLastCallRating) without needing to list
+      // every possible custom field in the schema.
+      const finalBody = customFields && typeof customFields === 'object'
+        ? { ...body, ...customFields }
+        : body;
+      const response = await fubApi.put(`/people/${id}`, finalBody, { params });
       return response.data;
     }
     case 'deletePerson': {
@@ -2122,11 +2266,11 @@ async function handleToolCall(name, args) {
       return { success: true, message: `Person ${args.id} deleted` };
     }
     case 'checkDuplicate': {
-      const response = await fubApi.get('/people/checkDuplicate', { params: args });
+      const response = await fubPaginatedGet('/people/checkDuplicate', args);
       return response.data;
     }
     case 'listUnclaimed': {
-      const response = await fubApi.get('/people/unclaimed', { params: args });
+      const response = await fubPaginatedGet('/people/unclaimed', args);
       return { people: response.data.people, _metadata: response.data._metadata };
     }
     case 'claimPerson': {
@@ -2155,7 +2299,7 @@ async function handleToolCall(name, args) {
 
     // ==================== PEOPLE RELATIONSHIPS ====================
     case 'listRelationships': {
-      const response = await fubApi.get('/peopleRelationships', { params: args });
+      const response = await fubPaginatedGet('/peopleRelationships', args);
       return { peopleRelationships: response.data.peopleRelationships, _metadata: response.data._metadata };
     }
     case 'createRelationship': {
@@ -2207,7 +2351,7 @@ async function handleToolCall(name, args) {
 
     // ==================== CALLS ====================
     case 'listCalls': {
-      const response = await fubApi.get('/calls', { params: args });
+      const response = await fubPaginatedGet('/calls', args);
       return { calls: response.data.calls, _metadata: response.data._metadata };
     }
     case 'createCall': {
@@ -2226,7 +2370,7 @@ async function handleToolCall(name, args) {
 
     // ==================== TEXT MESSAGES ====================
     case 'listTextMessages': {
-      const response = await fubApi.get('/textMessages', { params: args });
+      const response = await fubPaginatedGet('/textMessages', args);
       return { textMessages: response.data.textMessages, _metadata: response.data._metadata };
     }
     case 'createTextMessage': {
@@ -2240,7 +2384,7 @@ async function handleToolCall(name, args) {
 
     // ==================== USERS ====================
     case 'listUsers': {
-      const response = await fubApi.get('/users', { params: args });
+      const response = await fubPaginatedGet('/users', args);
       return { users: response.data.users, _metadata: response.data._metadata };
     }
     case 'getUser': {
@@ -2254,7 +2398,7 @@ async function handleToolCall(name, args) {
 
     // ==================== SMART LISTS ====================
     case 'listSmartLists': {
-      const response = await fubApi.get('/smartLists', { params: args });
+      const response = await fubPaginatedGet('/smartLists', args);
       return { smartLists: response.data.smartLists, _metadata: response.data._metadata };
     }
     case 'getSmartList': {
@@ -2264,11 +2408,11 @@ async function handleToolCall(name, args) {
 
     // ==================== ACTION PLANS ====================
     case 'listActionPlans': {
-      const response = await fubApi.get('/actionPlans', { params: args });
+      const response = await fubPaginatedGet('/actionPlans', args);
       return { actionPlans: response.data.actionPlans, _metadata: response.data._metadata };
     }
     case 'listActionPlansPeople': {
-      const response = await fubApi.get('/actionPlansPeople', { params: args });
+      const response = await fubPaginatedGet('/actionPlansPeople', args);
       return { actionPlansPeople: response.data.actionPlansPeople, _metadata: response.data._metadata };
     }
     case 'addPersonToActionPlan': {
@@ -2283,7 +2427,7 @@ async function handleToolCall(name, args) {
 
     // ==================== AUTOMATIONS ====================
     case 'listAutomations': {
-      const response = await fubApi.get('/automations', { params: args });
+      const response = await fubPaginatedGet('/automations', args);
       return { automations: response.data.automations, _metadata: response.data._metadata };
     }
     case 'getAutomation': {
@@ -2291,7 +2435,7 @@ async function handleToolCall(name, args) {
       return response.data;
     }
     case 'listAutomationsPeople': {
-      const response = await fubApi.get('/automationsPeople', { params: args });
+      const response = await fubPaginatedGet('/automationsPeople', args);
       return { automationsPeople: response.data.automationsPeople, _metadata: response.data._metadata };
     }
     case 'getAutomationPerson': {
@@ -2310,7 +2454,7 @@ async function handleToolCall(name, args) {
 
     // ==================== EMAIL TEMPLATES ====================
     case 'listTemplates': {
-      const response = await fubApi.get('/templates', { params: args });
+      const response = await fubPaginatedGet('/templates', args);
       return { templates: response.data.templates, _metadata: response.data._metadata };
     }
     case 'createTemplate': {
@@ -2337,7 +2481,7 @@ async function handleToolCall(name, args) {
 
     // ==================== TEXT MESSAGE TEMPLATES ====================
     case 'listTextMessageTemplates': {
-      const response = await fubApi.get('/textMessageTemplates', { params: args });
+      const response = await fubPaginatedGet('/textMessageTemplates', args);
       return { textMessageTemplates: response.data.textMessageTemplates, _metadata: response.data._metadata };
     }
     case 'createTextMessageTemplate': {
@@ -2364,7 +2508,7 @@ async function handleToolCall(name, args) {
 
     // ==================== EMAIL MARKETING ====================
     case 'listEmEvents': {
-      const response = await fubApi.get('/emEvents', { params: args });
+      const response = await fubPaginatedGet('/emEvents', args);
       return { emEvents: response.data.emEvents, _metadata: response.data._metadata };
     }
     case 'createEmEvent': {
@@ -2372,7 +2516,7 @@ async function handleToolCall(name, args) {
       return response.data;
     }
     case 'listEmCampaigns': {
-      const response = await fubApi.get('/emCampaigns', { params: args });
+      const response = await fubPaginatedGet('/emCampaigns', args);
       return { emCampaigns: response.data.emCampaigns, _metadata: response.data._metadata };
     }
     case 'createEmCampaign': {
@@ -2387,7 +2531,7 @@ async function handleToolCall(name, args) {
 
     // ==================== CUSTOM FIELDS ====================
     case 'listCustomFields': {
-      const response = await fubApi.get('/customFields');
+      const response = await fubPaginatedGet('/customFields', args);
       return { customFields: response.data.customFields, _metadata: response.data._metadata };
     }
     case 'createCustomField': {
@@ -2410,7 +2554,7 @@ async function handleToolCall(name, args) {
 
     // ==================== STAGES ====================
     case 'listStages': {
-      const response = await fubApi.get('/stages');
+      const response = await fubPaginatedGet('/stages', args);
       return { stages: response.data.stages, _metadata: response.data._metadata };
     }
     case 'createStage': {
@@ -2433,7 +2577,7 @@ async function handleToolCall(name, args) {
 
     // ==================== TASKS ====================
     case 'listTasks': {
-      const response = await fubApi.get('/tasks', { params: args });
+      const response = await fubPaginatedGet('/tasks', args);
       return { tasks: response.data.tasks, _metadata: response.data._metadata };
     }
     case 'createTask': {
@@ -2456,7 +2600,7 @@ async function handleToolCall(name, args) {
 
     // ==================== APPOINTMENTS ====================
     case 'listAppointments': {
-      const response = await fubApi.get('/appointments', { params: args });
+      const response = await fubPaginatedGet('/appointments', args);
       return { appointments: response.data.appointments, _metadata: response.data._metadata };
     }
     case 'createAppointment': {
@@ -2479,7 +2623,7 @@ async function handleToolCall(name, args) {
 
     // ==================== APPOINTMENT TYPES ====================
     case 'listAppointmentTypes': {
-      const response = await fubApi.get('/appointmentTypes');
+      const response = await fubPaginatedGet('/appointmentTypes', args);
       return { appointmentTypes: response.data.appointmentTypes, _metadata: response.data._metadata };
     }
     case 'createAppointmentType': {
@@ -2502,7 +2646,7 @@ async function handleToolCall(name, args) {
 
     // ==================== APPOINTMENT OUTCOMES ====================
     case 'listAppointmentOutcomes': {
-      const response = await fubApi.get('/appointmentOutcomes');
+      const response = await fubPaginatedGet('/appointmentOutcomes', args);
       return { appointmentOutcomes: response.data.appointmentOutcomes, _metadata: response.data._metadata };
     }
     case 'createAppointmentOutcome': {
@@ -2525,7 +2669,7 @@ async function handleToolCall(name, args) {
 
     // ==================== WEBHOOKS ====================
     case 'listWebhooks': {
-      const response = await fubApi.get('/webhooks');
+      const response = await fubPaginatedGet('/webhooks', args);
       return { webhooks: response.data.webhooks, _metadata: response.data._metadata };
     }
     case 'createWebhook': {
@@ -2552,7 +2696,7 @@ async function handleToolCall(name, args) {
 
     // ==================== PIPELINES ====================
     case 'listPipelines': {
-      const response = await fubApi.get('/pipelines');
+      const response = await fubPaginatedGet('/pipelines', args);
       return { pipelines: response.data.pipelines, _metadata: response.data._metadata };
     }
     case 'createPipeline': {
@@ -2575,7 +2719,7 @@ async function handleToolCall(name, args) {
 
     // ==================== DEALS ====================
     case 'listDeals': {
-      const response = await fubApi.get('/deals', { params: args });
+      const response = await fubPaginatedGet('/deals', args);
       return { deals: response.data.deals, _metadata: response.data._metadata };
     }
     case 'createDeal': {
@@ -2617,7 +2761,7 @@ async function handleToolCall(name, args) {
 
     // ==================== DEAL CUSTOM FIELDS ====================
     case 'listDealCustomFields': {
-      const response = await fubApi.get('/dealCustomFields');
+      const response = await fubPaginatedGet('/dealCustomFields', args);
       return { dealCustomFields: response.data.dealCustomFields, _metadata: response.data._metadata };
     }
     case 'createDealCustomField': {
@@ -2640,11 +2784,11 @@ async function handleToolCall(name, args) {
 
     // ==================== GROUPS ====================
     case 'listGroups': {
-      const response = await fubApi.get('/groups');
+      const response = await fubPaginatedGet('/groups', args);
       return { groups: response.data.groups, _metadata: response.data._metadata };
     }
     case 'listRoundRobinGroups': {
-      const response = await fubApi.get('/groups/roundRobin');
+      const response = await fubPaginatedGet('/groups/roundRobin', args);
       return { groups: response.data.groups, _metadata: response.data._metadata };
     }
     case 'createGroup': {
@@ -2667,7 +2811,7 @@ async function handleToolCall(name, args) {
 
     // ==================== TEAMS ====================
     case 'listTeams': {
-      const response = await fubApi.get('/teams');
+      const response = await fubPaginatedGet('/teams', args);
       return { teams: response.data.teams, _metadata: response.data._metadata };
     }
     case 'createTeam': {
@@ -2690,13 +2834,13 @@ async function handleToolCall(name, args) {
 
     // ==================== TEAM INBOXES ====================
     case 'listTeamInboxes': {
-      const response = await fubApi.get('/teamInboxes');
+      const response = await fubPaginatedGet('/teamInboxes', args);
       return { teamInboxes: response.data.teamInboxes, _metadata: response.data._metadata };
     }
 
     // ==================== PONDS ====================
     case 'listPonds': {
-      const response = await fubApi.get('/ponds');
+      const response = await fubPaginatedGet('/ponds', args);
       return { ponds: response.data.ponds, _metadata: response.data._metadata };
     }
     case 'createPond': {
@@ -2719,7 +2863,7 @@ async function handleToolCall(name, args) {
 
     // ==================== TIMEFRAMES ====================
     case 'listTimeframes': {
-      const response = await fubApi.get('/timeframes');
+      const response = await fubPaginatedGet('/timeframes', args);
       return { timeframes: response.data.timeframes, _metadata: response.data._metadata };
     }
 
@@ -2741,7 +2885,7 @@ async function handleToolCall(name, args) {
       return response.data;
     }
     case 'inboxAppGetParticipants': {
-      const response = await fubApi.get('/inboxApps/participants', { params: args });
+      const response = await fubPaginatedGet('/inboxApps/participants', args);
       return response.data;
     }
     case 'inboxAppCreateParticipant': {
@@ -2761,7 +2905,7 @@ async function handleToolCall(name, args) {
       return { success: true, message: 'Inbox app deactivated' };
     }
     case 'listInboxAppInstallations': {
-      const response = await fubApi.get('/inboxApps/installations');
+      const response = await fubPaginatedGet('/inboxApps/installations', args);
       return response.data;
     }
 
@@ -2896,10 +3040,112 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function main() {
+// ---------------------------------------------------------------------------
+// Transports: stdio (default, for local Cowork / Claude Desktop) or HTTP
+// (for remote deployments — set MCP_TRANSPORT=http).
+// ---------------------------------------------------------------------------
+
+async function startStdio() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`Follow Up Boss MCP Server v1.1.1 started (${activeTools.length} tools${FUB_SAFE_MODE ? ', SAFE MODE — delete tools disabled' : ''})`);
+  console.error(`Follow Up Boss MCP Server v1.1.1 started via stdio (${activeTools.length} tools${FUB_SAFE_MODE ? ', SAFE MODE — delete tools disabled' : ''})`);
 }
 
-main().catch(console.error);
+async function startHttp() {
+  const PORT = parseInt(process.env.PORT || '3000', 10);
+  const BEARER = process.env.MCP_BEARER_TOKEN;
+  if (!BEARER) {
+    console.error('ERROR: MCP_BEARER_TOKEN is required when MCP_TRANSPORT=http. Set a strong random secret (32+ chars).');
+    process.exit(1);
+  }
+
+  const app = express();
+  app.use(express.json({ limit: '4mb' }));
+
+  // Health endpoint for Railway / Claude connector probe. No auth.
+  app.get('/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      version: '1.1.1',
+      tools: activeTools.length,
+      safeMode: FUB_SAFE_MODE,
+      ts: new Date().toISOString()
+    });
+  });
+
+  // Bearer auth middleware — protects every /mcp route.
+  const requireAuth = (req, res, next) => {
+    const header = req.headers['authorization'] || '';
+    if (!header.startsWith('Bearer ') || header.slice(7).trim() !== BEARER) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    next();
+  };
+
+  // Stateful transport: each session gets its own transport + server instance.
+  // This is the safer default for MCP, though it requires the client to send
+  // the Mcp-Session-Id header after init.
+  const transports = new Map(); // sessionId -> transport
+
+  app.post('/mcp', requireAuth, async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    let transport = sessionId ? transports.get(sessionId) : undefined;
+    if (!transport) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (id) => transports.set(id, transport)
+      });
+      transport.onclose = () => {
+        if (transport.sessionId) transports.delete(transport.sessionId);
+      };
+      // Fresh Server instance per session so state is isolated.
+      // We reuse the single `server` here since it's stateless across sessions.
+      await server.connect(transport);
+    }
+    try {
+      await transport.handleRequest(req, res, req.body);
+    } catch (e) {
+      console.error('MCP POST error', e);
+      if (!res.headersSent) res.status(500).json({ error: 'transport_error' });
+    }
+  });
+
+  app.get('/mcp', requireAuth, async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    const transport = sessionId ? transports.get(sessionId) : undefined;
+    if (!transport) return res.status(400).json({ error: 'invalid_session' });
+    try {
+      await transport.handleRequest(req, res);
+    } catch (e) {
+      console.error('MCP GET error', e);
+    }
+  });
+
+  app.delete('/mcp', requireAuth, async (req, res) => {
+    const sessionId = req.headers['mcp-session-id'];
+    const transport = sessionId ? transports.get(sessionId) : undefined;
+    if (!transport) return res.status(400).json({ error: 'invalid_session' });
+    try {
+      await transport.handleRequest(req, res);
+    } catch (e) {
+      console.error('MCP DELETE error', e);
+    }
+  });
+
+  app.listen(PORT, () => {
+    console.error(`Follow Up Boss MCP Server v1.1.1 listening on :${PORT} (HTTP, ${activeTools.length} tools${FUB_SAFE_MODE ? ', SAFE MODE' : ''})`);
+  });
+}
+
+async function main() {
+  if (process.env.MCP_TRANSPORT === 'http') {
+    await startHttp();
+  } else {
+    await startStdio();
+  }
+}
+
+main().catch((e) => {
+  console.error('Fatal:', e);
+  process.exit(1);
+});
