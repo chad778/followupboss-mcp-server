@@ -3006,39 +3006,46 @@ async function handleToolCall(name, args) {
 // MCP Server Setup
 // ---------------------------------------------------------------------------
 
-const server = new Server(
-  { name: 'followupboss-mcp-server', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-);
-
 const activeTools = FUB_SAFE_MODE
   ? TOOL_DEFINITIONS.filter(t => !t.name.toLowerCase().startsWith('delete') && t.name !== 'inboxAppDeleteParticipant' && t.name !== 'deleteReaction')
   : TOOL_DEFINITIONS;
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: activeTools
-}));
+// Factory: returns a fresh MCP Server instance with tool handlers wired up.
+// The SDK's Server can only be bound to ONE transport, so for HTTP mode we
+// need a new instance per session.
+function createServer() {
+  const server = new Server(
+    { name: 'followupboss-mcp-server', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  );
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-  if (FUB_SAFE_MODE && (name.toLowerCase().startsWith('delete') || name === 'inboxAppDeleteParticipant' || name === 'deleteReaction')) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ error: 'This tool is disabled in Safe Mode. To enable delete operations, set FUB_SAFE_MODE=false or remove it from your config.' }, null, 2) }],
-      isError: true,
-    };
-  }
-  try {
-    const result = await handleToolCall(name, args || {});
-    return {
-      content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-    };
-  } catch (error) {
-    return {
-      content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
-      isError: true,
-    };
-  }
-});
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    tools: activeTools
+  }));
+
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    if (FUB_SAFE_MODE && (name.toLowerCase().startsWith('delete') || name === 'inboxAppDeleteParticipant' || name === 'deleteReaction')) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: 'This tool is disabled in Safe Mode. To enable delete operations, set FUB_SAFE_MODE=false or remove it from your config.' }, null, 2) }],
+        isError: true,
+      };
+    }
+    try {
+      const result = await handleToolCall(name, args || {});
+      return {
+        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ error: error.message }, null, 2) }],
+        isError: true,
+      };
+    }
+  });
+
+  return server;
+}
 
 // ---------------------------------------------------------------------------
 // Transports: stdio (default, for local Cowork / Claude Desktop) or HTTP
@@ -3047,6 +3054,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 async function startStdio() {
   const transport = new StdioServerTransport();
+  const server = createServer();
   await server.connect(transport);
   console.error(`Follow Up Boss MCP Server v1.1.1 started via stdio (${activeTools.length} tools${FUB_SAFE_MODE ? ', SAFE MODE — delete tools disabled' : ''})`);
 }
@@ -3319,6 +3327,9 @@ async function startHttp() {
     const sessionId = req.headers['mcp-session-id'];
     let transport = sessionId ? transports.get(sessionId) : undefined;
     if (!transport) {
+      // Fresh MCP Server + transport for this session. The SDK's Server can
+      // only be connected to one transport, so we need a new instance here.
+      const mcpServer = createServer();
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (id) => transports.set(id, transport)
@@ -3326,9 +3337,7 @@ async function startHttp() {
       transport.onclose = () => {
         if (transport.sessionId) transports.delete(transport.sessionId);
       };
-      // Fresh Server instance per session so state is isolated.
-      // We reuse the single `server` here since it's stateless across sessions.
-      await server.connect(transport);
+      await mcpServer.connect(transport);
     }
     try {
       await transport.handleRequest(req, res, req.body);
