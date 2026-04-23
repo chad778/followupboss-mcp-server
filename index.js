@@ -297,6 +297,20 @@ const TOOL_DEFINITIONS = [
   }
 },
 {
+  "name": "getTeamActivityRange",
+  "description": "Server-side aggregated team activity for any UTC time window. Paginates calls and appointments internally and returns ONE compact summary: per-agent convos, dials, appts; team totals; zero-dial list; agent roster. Use this for multi-day views (week-to-date, yesterday, custom ranges) instead of making the client paginate listCalls dozens of times. Automatically excludes admin / non-producing accounts.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "startUtc": { "type": "string", "description": "Window start (inclusive) as ISO-8601 UTC timestamp, e.g. '2026-04-20T04:00:00Z' for Monday 00:00 ET." },
+      "endUtc": { "type": "string", "description": "Window end (inclusive) as ISO-8601 UTC timestamp. Omit to use now." },
+      "excludeUserIds": { "type": "array", "items": { "type": "number" }, "description": "User IDs to exclude from agent views (default [31, 66])" },
+      "convosMinSeconds": { "type": "number", "description": "Min call duration to count as a conversation (default 120)" }
+    },
+    "required": ["startUtc"]
+  }
+},
+{
   "name": "listUncontactedLeads",
   "description": "Voice-friendly convenience tool. Returns recent leads that have NOT been contacted yet, automatically excluding Expireds, FSBOs, and Do Not Contact ponds so you only see workable new leads. Use this for quick daily triage and for picking leads to reassign. Returns compact lean records.",
   "inputSchema": {
@@ -2389,6 +2403,118 @@ async function handleToolCall(name, args) {
         zero_dials: zeros,
         pages_scanned: pagesScanned,
         calls_scanned: totalScanned
+      };
+    }
+    case 'getTeamActivityRange': {
+      const defaultExcludes = [31, 66];
+      const excludeSet = new Set(Array.isArray(args.excludeUserIds) ? args.excludeUserIds : defaultExcludes);
+      const convoMin = typeof args.convosMinSeconds === 'number' && args.convosMinSeconds > 0 ? args.convosMinSeconds : 120;
+      if (!args.startUtc) throw new Error('startUtc is required');
+      const startUTC = new Date(args.startUtc);
+      const endUTC = args.endUtc ? new Date(args.endUtc) : new Date();
+      if (isNaN(startUTC.getTime())) throw new Error('Invalid startUtc');
+      if (isNaN(endUTC.getTime())) throw new Error('Invalid endUtc');
+
+      // Users for name lookup
+      const usersResp = await fubPaginatedGet('/users', { limit: 100 });
+      const userMap = {};
+      for (const u of (usersResp.data.users || [])) userMap[u.id] = u;
+
+      // Paginate calls backwards from newest until oldest < startUTC
+      const byUser = {};
+      let cursor = null, pagesScanned = 0, totalScanned = 0;
+      const maxPages = 80; // 8000 calls max, covers >1 week for most teams
+      const seen = new Set();
+      while (pagesScanned < maxPages) {
+        const pageArgs = { limit: 100 };
+        if (cursor) pageArgs.next = cursor;
+        const response = await fubPaginatedGet('/calls', pageArgs);
+        pagesScanned++;
+        const calls = response.data.calls || [];
+        if (!calls.length) break;
+        let oldestInPage = null;
+        for (const c of calls) {
+          if (seen.has(c.id)) continue;
+          seen.add(c.id);
+          totalScanned++;
+          const ts = new Date(c.created || c.startedAt);
+          if (!oldestInPage || ts < oldestInPage) oldestInPage = ts;
+          if (ts < startUTC || ts > endUTC) continue;
+          const uid = c.userId || 0;
+          if (excludeSet.has(uid)) continue;
+          if (!byUser[uid]) byUser[uid] = { userId: uid, name: userMap[uid]?.name || `user_${uid}`, convos: 0, dials: 0, appts: 0 };
+          byUser[uid].dials++;
+          if ((c.duration || 0) >= convoMin) byUser[uid].convos++;
+        }
+        if (oldestInPage && oldestInPage < startUTC) break;
+        cursor = response.data._metadata?.next;
+        if (!cursor) break;
+      }
+
+      // Paginate appointments for the same range (for per-agent appts & team totals)
+      let apptsBooked = 0, apptsStarting = 0;
+      let apptCursor = null, apptPages = 0;
+      const maxApptPages = 20;
+      while (apptPages < maxApptPages) {
+        const args2 = { limit: 100 };
+        if (apptCursor) args2.next = apptCursor;
+        const response = await fubPaginatedGet('/appointments', args2);
+        apptPages++;
+        const appts = response.data.appointments || [];
+        if (!appts.length) break;
+        let oldestInPage = null;
+        for (const a of appts) {
+          const created = new Date(a.created);
+          if (!oldestInPage || created < oldestInPage) oldestInPage = created;
+          if (created >= startUTC && created <= endUTC) {
+            const creator = a.createdById;
+            if (creator && !excludeSet.has(creator)) {
+              apptsBooked++;
+              if (!byUser[creator]) byUser[creator] = { userId: creator, name: userMap[creator]?.name || `user_${creator}`, convos: 0, dials: 0, appts: 0 };
+              byUser[creator].appts++;
+            }
+          }
+          const start = new Date(a.start);
+          if (start >= startUTC && start <= endUTC) apptsStarting++;
+        }
+        if (oldestInPage && oldestInPage < startUTC) break;
+        apptCursor = response.data._metadata?.next;
+        if (!apptCursor) break;
+      }
+
+      const rows = Object.values(byUser).sort((a, b) => b.convos - a.convos || b.dials - a.dials);
+      const totalConvos = rows.reduce((s, r) => s + r.convos, 0);
+      const totalDials = rows.reduce((s, r) => s + r.dials, 0);
+      const connectRate = totalDials ? +((100 * totalConvos / totalDials).toFixed(1)) : 0;
+      const setRate = totalConvos ? +((100 * apptsBooked / totalConvos).toFixed(1)) : 0;
+
+      // Zero-dial active Agent/Broker list
+      const zeros = [];
+      for (const u of Object.values(userMap)) {
+        if (u.status !== 'Active') continue;
+        if (excludeSet.has(u.id)) continue;
+        if (!['Agent', 'Broker'].includes(u.role)) continue;
+        if (byUser[u.id]) continue;
+        zeros.push({ userId: u.id, name: u.name, role: u.role });
+      }
+
+      return {
+        window: { start_utc: startUTC.toISOString(), end_utc: endUTC.toISOString() },
+        convo_min_seconds: convoMin,
+        excluded_user_ids: Array.from(excludeSet),
+        team: {
+          convos: totalConvos,
+          dials: totalDials,
+          appts_booked: apptsBooked,
+          appts_starting: apptsStarting,
+          connect_rate_pct: connectRate,
+          appt_set_rate_pct: setRate
+        },
+        agents: rows,
+        zero_dials: zeros,
+        pages_scanned: pagesScanned,
+        calls_scanned: totalScanned,
+        appt_pages_scanned: apptPages
       };
     }
     case 'listUncontactedLeads': {
