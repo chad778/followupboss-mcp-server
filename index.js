@@ -3,7 +3,7 @@
 /**
  * Follow Up Boss MCP Server
  *
- * A Model Context Protocol server that provides 157 tools
+ * A Model Context Protocol server that provides 158 tools
  * for interacting with the Follow Up Boss CRM API.
  *
  * https://github.com/mindwear-capitian/followupboss-mcp-server
@@ -139,6 +139,7 @@ const LEAN_FIELDS = {
   appointment: ['id', 'created', 'title', 'description', 'start', 'end', 'type', 'outcome', 'typeId', 'outcomeId', 'createdById', 'invitees'],
   task: ['id', 'created', 'name', 'type', 'dueDate', 'dueDateTime', 'isCompleted', 'completed', 'assignedUserId', 'AssignedTo', 'personId'],
   textMessage: ['id', 'created', 'personId', 'userId', 'userName', 'message', 'fromNumber', 'toNumber', 'isIncoming', 'status'],
+  note: ['id', 'created', 'updated', 'personId', 'userId', 'subject', 'body', 'isHtml'],
   event: ['id', 'created', 'personId', 'type', 'source', 'message', 'property'],
   deal: ['id', 'created', 'name', 'stage', 'stageId', 'pipelineId', 'price', 'closeDate', 'assignedUserId', 'assignedTo', 'personIds'],
   appointmentInvitee: ['userId', 'personId', 'name', 'email']
@@ -187,7 +188,7 @@ function handleApiError(error) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool Definitions (157 tools — 152 core + 5 convenience)
+// Tool Definitions (158 tools — 153 core + 5 convenience)
 // ---------------------------------------------------------------------------
 
 const TOOL_DEFINITIONS = [
@@ -577,6 +578,22 @@ const TOOL_DEFINITIONS = [
 },
 
 // ==================== NOTES ====================
+{
+  "name": "listNotes",
+  "description": "List notes. Filter by personId to get all notes on a contact — used by the lead call grader to find Speculo AI call transcripts written as person notes shortly after each call.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "personId": { "type": "number", "description": "Filter by person ID" },
+      "userId": { "type": "number", "description": "Filter by author user ID" },
+      "limit": { "type": "number", "description": "Maximum number of results to return" },
+      "next": { "type": "string", "description": "Cursor for next page of results" },
+      "offset": { "type": "number", "description": "Offset for pagination" },
+      "sort": { "type": "string", "description": "Sort order, e.g. 'created' or '-created' (newest first)" }
+    },
+    "required": []
+  }
+},
 {
   "name": "createNote",
   "description": "Create a note on a person. Supports @mentioning users via the mentionedUsers array — FUB will send them a notification.",
@@ -2664,6 +2681,10 @@ async function handleToolCall(name, args) {
     }
 
     // ==================== NOTES ====================
+    case 'listNotes': {
+      const response = await fubPaginatedGet('/notes', args);
+      return leanCollection(response, 'notes', 'note', args);
+    }
     case 'createNote': {
       const response = await fubApi.post('/notes', args);
       return response.data;
