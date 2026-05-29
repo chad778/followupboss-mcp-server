@@ -27,6 +27,7 @@
     "url": "https://github.com/mindwear-capitian/followupboss-mcp-server"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.100.1",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "axios": "^1.6.0",
     "express": "^4.19.0"
