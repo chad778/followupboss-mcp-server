@@ -7,13 +7,16 @@ Actions** — no local execution required.
 
 - **One-time backfill** of the trailing 30 days (triggered manually from the
   Actions tab).
-- **Automatic daily run** locked to **10pm America/New_York**, year round.
+- **Automatic hourly runs** during business hours (**7am–10pm America/New_York**),
+  year round. Each run refreshes **today's running totals** and re-finalizes
+  yesterday; the 10pm run is the day's final pass.
 
-> ⚠️ **8pm vs 10pm:** the original brief says "8pm Eastern" in the goal but the
-> detailed scheduling step specifies 10pm (`hour == 22`, cron at 02:00 & 03:00
-> UTC). This implementation uses **10pm**. To switch to 8pm, change
-> `RUN_HOUR_ET = 20` in `fub_sheets_sync.py` **and** the two cron lines in
-> `.github/workflows/fub-sheets-sync.yml` to `0 0 * * *` and `0 1 * * *`.
+> **Cadence / window:** the workflow fires hourly (UTC) and the script
+> (`maybe_gate_eastern_hour`) proceeds only when the wall-clock Eastern hour is
+> within `RUN_HOUR_START_ET`–`RUN_HOUR_END_ET` (default **7–22**). Runs outside
+> that window are ~5s no-ops. This is DST-proof — no cron math. To change the
+> window, edit those two constants in `fub_sheets_sync.py`. To run less often,
+> narrow the `cron` in `.github/workflows/fub-sheets-sync.yml`.
 
 ---
 
@@ -84,10 +87,10 @@ workflow `env:` block.
 Repo → **Actions → FUB Google Sheets Sync → Run workflow** → set **mode =
 `backfill`**, **days = `30`** → **Run**. This builds all tabs from scratch.
 
-### 6. Let the daily run take over
+### 6. Let the scheduled runs take over
 
-The schedule is already active. Every night it fires at 02:00 and 03:00 UTC;
-the script runs only on the one that is 10pm Eastern, computes **yesterday**,
+The schedule is already active. The workflow fires hourly; the script proceeds
+only during 7am–10pm Eastern, refreshes **today** and re-finalizes **yesterday**,
 appends activity + a fresh pipeline snapshot + any new closings, and recomputes
 the leaderboard.
 

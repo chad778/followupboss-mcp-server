@@ -64,13 +64,13 @@ EASTERN = pytz.timezone("America/New_York")
 # A "Conversation" is a logged call lasting at least this many seconds.
 CONVO_MIN_SECONDS = 120
 
-# Scheduled runs only proceed when the Eastern hour equals this. GitHub cron is
-# UTC and shifts with daylight saving, so the workflow fires at both 02:00 and
-# 03:00 UTC and the script gates on the wall-clock Eastern hour. 22 == 10pm ET.
-# NOTE: the brief's prose says "8pm" in one place and "10pm" in the detailed
-# scheduling step; this is set to the detailed spec (10pm). Change here + the
-# workflow cron together if 8pm is intended.
-RUN_HOUR_ET = 22
+# Scheduled runs proceed when the Eastern hour falls in this inclusive window.
+# GitHub cron is UTC and shifts with daylight saving, so the workflow fires
+# every hour (UTC) and the script gates on the wall-clock Eastern hour via
+# pytz -- DST-proof, no cron math. 7..22 == 7am through 10pm ET. The 10pm run
+# finalizes the day; the rest give a live intraday view.
+RUN_HOUR_START_ET = 7
+RUN_HOUR_END_ET = 22
 
 # Leaderboard pace targets.
 TARGET_CONVOS_PER_WEEK = 20
@@ -817,10 +817,10 @@ def compute_window(mode: str, days: int):
     if mode == "backfill":
         start_et = (now_et - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
         end_et = now_et
-    else:  # daily -> yesterday in Eastern
+    else:  # daily -> yesterday 00:00 ET through now (yesterday final + today live)
         yesterday = (now_et - timedelta(days=1)).date()
         start_et = EASTERN.localize(datetime(yesterday.year, yesterday.month, yesterday.day, 0, 0, 0))
-        end_et = EASTERN.localize(datetime(yesterday.year, yesterday.month, yesterday.day, 23, 59, 59))
+        end_et = now_et
     snapshot_date = now_et.strftime("%Y-%m-%d")
     return start_et.astimezone(pytz.utc), end_et.astimezone(pytz.utc), snapshot_date
 
@@ -830,8 +830,10 @@ def activity_rows_from_agg(agg: dict, active_agents: dict[int, str],
     """
     Convert the per-(date,user) aggregate into sheet rows. In backfill mode we
     emit a row for every agent for every day in the window (zeros included) so
-    the leaderboard's trailing windows are dense. In daily mode we emit one row
-    per active agent for the single day.
+    the leaderboard's trailing windows are dense. In daily mode we emit rows for
+    every day the window spans (yesterday + today), so intraday runs keep
+    today's running totals fresh while yesterday stays finalized; the upsert on
+    (date, agent) makes repeated runs idempotent.
     """
     cols = HEADERS[TAB_ACTIVITY][2:]  # metric columns after date+agent
     rows = []
@@ -840,7 +842,11 @@ def activity_rows_from_agg(agg: dict, active_agents: dict[int, str],
     start_d = start_utc.astimezone(EASTERN).date()
     end_d = end_utc.astimezone(EASTERN).date()
     if mode == "daily":
-        date_list = [start_d]  # the single yesterday
+        date_list = []
+        d = start_d  # yesterday .. today inclusive
+        while d <= end_d:
+            date_list.append(d)
+            d += timedelta(days=1)
     else:
         date_list = []
         d = start_d
@@ -1011,16 +1017,19 @@ def write_config_tab(writer: SheetWriter, cfg: AccountConfig, mode: str,
 
 def maybe_gate_eastern_hour(force: bool) -> None:
     """
-    Scheduled runs fire at both 02:00 and 03:00 UTC; only the one landing on
-    22:00 Eastern should proceed. workflow_dispatch and --force bypass the gate.
+    The workflow fires hourly (UTC). A scheduled run proceeds only when the
+    wall-clock Eastern hour is within the business window [RUN_HOUR_START_ET,
+    RUN_HOUR_END_ET]; outside it the run is a ~5s no-op. workflow_dispatch and
+    --force bypass the gate entirely.
     """
     if force:
         return
     if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
         return  # manual / dispatch runs always proceed
     hour = datetime.now(EASTERN).hour
-    if hour != RUN_HOUR_ET:
-        log(f"Scheduled run at Eastern hour {hour:02d}:00 != {RUN_HOUR_ET}:00; skipping.")
+    if not (RUN_HOUR_START_ET <= hour <= RUN_HOUR_END_ET):
+        log(f"Scheduled run at Eastern hour {hour:02d}:00 outside business "
+            f"window {RUN_HOUR_START_ET}:00-{RUN_HOUR_END_ET}:00; skipping.")
         sys.exit(0)
 
 
