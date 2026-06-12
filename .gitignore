@@ -6,3 +6,8 @@ node_modules/
 .git_token_temp
 auth_and_push.sh
 .railway-secrets-DO-NOT-COMMIT.txt
+
+# Python
+sheets_sync/__pycache__/
+*.pyc
+__pycache__/
