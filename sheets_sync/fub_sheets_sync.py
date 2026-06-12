@@ -351,10 +351,23 @@ class AccountConfig:
 
     def _discover_outcomes(self) -> None:
         outcomes = self.fub.try_get("/appointmentOutcomes", "appointmentOutcomes", {"limit": 100})
-        if not outcomes:
-            self.notes.append("appointmentOutcomes returned no list body; 'met' uses name heuristic")
         for o in outcomes or []:
             self.outcomes[o.get("id")] = o.get("name") or ""
+        # The list endpoint can return an empty body on this account; fall back
+        # to per-ID lookups so the Config tab documents the outcomes and "met"
+        # detection can resolve appointments that carry only an outcomeId.
+        if not self.outcomes:
+            for oid in range(1, 21):
+                try:
+                    o = self.fub.get_one(f"/appointmentOutcomes/{oid}")
+                    if o and o.get("id"):
+                        self.outcomes[o["id"]] = o.get("name") or ""
+                except FUBError:
+                    continue
+            if self.outcomes:
+                self.notes.append("appointmentOutcomes list was empty; resolved via per-ID lookup")
+            else:
+                self.notes.append("appointmentOutcomes unresolved; 'met' uses appointment.outcome name only")
         log(f"Appointment outcomes: {len(self.outcomes)}")
 
     def _discover_ponds(self) -> None:
@@ -387,6 +400,10 @@ class Metrics:
         self.fub = fub
         self.cfg = cfg
         self.texts_supported = True  # flipped off if /textMessages can't be swept
+        # FUB /notes exposes no author and ignores the userId filter (verified:
+        # per-agent queries return identical account-wide counts), so notes
+        # cannot be attributed to an agent. Left off until/unless that changes.
+        self.notes_supported = False
 
     # --- activity (per agent per day) --------------------------------------
 
@@ -511,25 +528,17 @@ class Metrics:
         log(f"New leads assigned in window: {count}")
 
     def _collect_notes(self, start_utc, end_utc, bucket) -> None:
-        # /notes list payloads omit the author, so query per agent with userId
-        # filter. /notes fields -> "notes":
-        #   created in window, one row per note authored by the agent.
-        total = 0
-        for uid in self.cfg.active_agents:
-            for n in self.fub.iter_collection(
-                "/notes", "notes", {"limit": 100, "userId": uid, "sort": "-created"}
-            ):
-                ts = parse_ts(n.get("created"))
-                if ts is None:
-                    continue
-                if ts < start_utc:
-                    break
-                if ts > end_utc:
-                    continue
-                d = ts.astimezone(EASTERN).strftime("%Y-%m-%d")
-                bucket(d, uid, "notes")
-                total += 1
-        log(f"Notes in window: {total}")
+        # FUB /notes does NOT expose the note's author and the userId filter is
+        # silently ignored -- querying per agent returns identical account-wide
+        # counts. Notes therefore cannot be attributed to an agent, so the
+        # column is left blank and flagged (same treatment as texts). Scanning
+        # is skipped entirely (it was also 23x redundant and the slowest step).
+        self.notes_supported = False
+        self.fub.endpoint_errors.append(
+            "/notes: per-agent attribution unavailable (no author field; "
+            "userId filter ignored) -- notes column left blank"
+        )
+        log("Notes: per-agent attribution unavailable in FUB API; column left blank")
 
     # --- pipeline snapshot + closings --------------------------------------
 
@@ -889,10 +898,14 @@ def run(mode: str, days: int) -> None:
 
     activity_rows, zero_count = activity_rows_from_agg(agg, cfg.active_agents, mode, start_utc, end_utc)
 
-    # If texts were unsupported, blank that column (index 5) so we don't imply 0.
+    # Blank columns we can't truthfully populate, so we don't imply a real 0.
+    # texts sent = index 5, notes = index 9 (see HEADERS[TAB_ACTIVITY]).
     if not metrics.texts_supported:
         for r in activity_rows:
             r[5] = ""
+    if not metrics.notes_supported:
+        for r in activity_rows:
+            r[9] = ""
 
     # Pipeline snapshot rows: one per agent (active agents that have any deal,
     # plus zeros for the rest so the operator sees the whole roster).
@@ -937,12 +950,14 @@ def run(mode: str, days: int) -> None:
         f"closings_added={closings_written} | leaderboard_rows={len(leaderboard)} | "
         f"zero_activity_agents={zero_count} | "
         f"endpoint_errors={len(fub.endpoint_errors)} | "
-        f"texts_supported={metrics.texts_supported}"
+        f"texts_supported={metrics.texts_supported} | "
+        f"notes_supported={metrics.notes_supported}"
     )
     log("RUN SUMMARY: " + summary)
 
     write_config_tab(writer, cfg, mode, snapshot_date, rows_written, summary,
-                     fub.endpoint_errors, metrics.texts_supported)
+                     fub.endpoint_errors, metrics.texts_supported,
+                     metrics.notes_supported)
 
     # If any endpoint errored, surface it but don't fail the whole run unless
     # it was an auth failure (already handled above).
@@ -952,7 +967,8 @@ def run(mode: str, days: int) -> None:
 
 def write_config_tab(writer: SheetWriter, cfg: AccountConfig, mode: str,
                      snapshot_date: str, rows_written: int, summary: str,
-                     endpoint_errors: list[str], texts_supported: bool) -> None:
+                     endpoint_errors: list[str], texts_supported: bool,
+                     notes_supported: bool) -> None:
     """Document every resolved mapping + the run summary so it can be audited."""
     rows: list[list] = []
     rows.append(["last run (ET)", datetime.now(EASTERN).strftime("%Y-%m-%d %H:%M:%S %Z")])
@@ -962,6 +978,7 @@ def write_config_tab(writer: SheetWriter, cfg: AccountConfig, mode: str,
     rows.append(["run summary", summary])
     rows.append(["conversation threshold (s)", CONVO_MIN_SECONDS])
     rows.append(["texts endpoint supported", str(texts_supported)])
+    rows.append(["notes per-agent supported", str(notes_supported)])
     rows.append(["--- ACTIVE AGENTS (userId -> name) ---", ""])
     for uid, name in sorted(cfg.active_agents.items()):
         rows.append([f"user {uid}", name])

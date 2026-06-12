@@ -144,7 +144,7 @@ common assumptions in the brief. **Please confirm the ones marked ⚠️.**
 | Conversations | `/calls` with `duration ≥ 120s`. |
 | Dials / outbound | `/calls` count; `isIncoming == false` for outbound. |
 | New leads assigned | `/people` created in window, by `assignedUserId`. |
-| Notes | ⚠️ `/notes` **list payloads omit the author**, so notes are counted per agent via `/notes?userId=<id>`. |
+| Notes | ⚠️ **Not attributable per agent.** `/notes` exposes no author field and the `userId` filter is silently ignored (verified: per-agent queries return identical account-wide counts). The **notes** column is left **blank** and flagged, like texts. See Known gaps. |
 | Deal agent attribution | ⚠️ Deals have **no `assignedUserId`**; agents come from **`deal.users[]`**. A deal with multiple agents is counted for each (rare on a small team). |
 | Deal value | `deal.price`. |
 | Projected closings this month | open deals with `projectedCloseDate` in the current Eastern month. |
@@ -160,6 +160,12 @@ common assumptions in the brief. **Please confirm the ones marked ⚠️.**
   records `texts_supported = False` in the Config tab + Actions log. If you want
   this metric, we'll need a per-person iteration strategy (phase 2) or a FUB
   plan/permission that allows the account-wide list.
+- **Notes per agent.** ⚠️ FUB's `/notes` API neither returns the note's author
+  nor honors a `userId` filter, so notes cannot be attributed to an individual
+  agent. The **notes** column is left blank and `notes_per_agent_supported =
+  False` is recorded in the Config tab. If you want this, the only path is a
+  per-person walk of every contact's notes (phase 2) — and it still wouldn't
+  give you the author, only the contact.
 - **Dials undercount.** Dials only count calls that actually log into FUB. Calls
   made from a cell phone that isn't connected to FUB will not be counted.
 - **Speed-to-lead** and **unworked pond aging** are **phase 2**. `/ponds` is
