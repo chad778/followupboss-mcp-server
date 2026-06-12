@@ -1,17 +1,17 @@
 name: FUB Google Sheets Sync
 
 # Two triggers:
-#  1. schedule  -> fires daily at BOTH 02:00 and 03:00 UTC. GitHub cron is UTC
-#     and 10pm Eastern shifts with daylight saving, so we fire at both candidate
-#     hours and the script (maybe_gate_eastern_hour) proceeds only on the run
-#     that lands on 22:00 America/New_York. This locks the daily run to exactly
-#     10pm Eastern year round.
+#  1. schedule  -> fires every hour (UTC). GitHub cron is UTC and Eastern shifts
+#     with daylight saving, so rather than do cron math we fire hourly and let
+#     the script (maybe_gate_eastern_hour) proceed only when the wall-clock
+#     Eastern hour is 7am-10pm. Runs outside that window are ~5s no-ops. Each
+#     run refreshes today's running totals and re-finalizes yesterday; the 10pm
+#     run is the day's final pass. This is DST-proof.
 #  2. workflow_dispatch -> manual run from the Actions tab, with a mode input so
 #     the operator can trigger the one-time backfill without a terminal.
 on:
   schedule:
-    - cron: "0 2 * * *"   # 02:00 UTC == 10pm EDT (Mar-Nov)
-    - cron: "0 3 * * *"   # 03:00 UTC == 10pm EST (Nov-Mar)
+    - cron: "0 * * * *"   # hourly; the script gates to 7am-10pm Eastern
   workflow_dispatch:
     inputs:
       mode:
