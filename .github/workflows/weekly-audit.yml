@@ -1,0 +1,47 @@
+name: Weekly FUB Activity Audit
+
+# Fires at 8:00 PM ET every Sunday.
+#
+# Eastern time shifts with DST, so rather than do cron math we fire at both
+# candidate UTC times (midnight and 1 AM Monday) and let the OS / GitHub
+# schedule handle which is actually 8 PM ET on a given date.
+#
+# - EDT (Mar–Nov):  8 PM ET = 00:00 UTC Monday
+# - EST (Nov–Mar):  8 PM ET = 01:00 UTC Monday
+on:
+  schedule:
+    - cron: "0 0 * * 1"   # 00:00 UTC Monday  (8 PM ET, EDT)
+    - cron: "0 1 * * 1"   # 01:00 UTC Monday  (8 PM ET, EST)
+  workflow_dispatch:       # manual trigger from the Actions tab
+
+concurrency:
+  group: weekly-fub-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: sheets_sync/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r sheets_sync/requirements.txt
+
+      - name: Run weekly audit
+        env:
+          FUB_API_KEY: ${{ secrets.FUB_API_KEY }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          # Optional: override the hardcoded webhook URL via a repo secret.
+          GCHAT_WEBHOOK_URL: ${{ secrets.GCHAT_WEBHOOK_URL }}
+        run: python sheets_sync/weekly_audit.py
