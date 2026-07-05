@@ -5,6 +5,11 @@ a single Google Spreadsheet, giving a real-estate team operator a daily
 agent-level activity and pipeline dashboard. It runs entirely on **GitHub
 Actions** — no local execution required.
 
+A second, companion workflow (`fub_daily_audit.py`) reads that same
+spreadsheet every evening and posts a color-coded per-agent scorecard to
+Google Chat. See [**Daily activity audit**](#daily-activity-audit-google-chat)
+below.
+
 - **One-time backfill** of the trailing 30 days (triggered manually from the
   Actions tab).
 - **Automatic hourly runs** during business hours (**7am–10pm America/New_York**),
@@ -129,6 +134,61 @@ activity, endpoints that errored, and whether the texts endpoint was usable.
   the Actions run shows **red** and you get notified.
 - Per-endpoint errors (e.g. a flaky list call) are logged and recorded in the
   Config tab without aborting the whole run.
+
+---
+
+## Daily activity audit (Google Chat)
+
+`fub_daily_audit.py` is a separate, read-only script/workflow
+(`.github/workflows/fub-daily-audit.yml`) that runs every evening around
+**8:00pm America/New_York** and posts a per-agent scorecard to a Google Chat
+webhook — no email, no separate dashboard, just a message in the space.
+
+**What it audits:** *yesterday's* row from the **Daily Activity** tab (a
+fully-completed day, not the in-progress one) — dials total, outbound dials,
+conversations, and appointments set — plus each agent's trailing-7-day
+conversations/appointments from **Leaderboard** for context.
+
+**Who's excluded:** admin, leadership, and lending staff aren't graded on
+sales activity: **Chad Leonberg, Brittany Leonberg, Dennis Palapar, Danielle
+Heitner**. Edit the `EXCLUDED_AGENTS` set in `fub_daily_audit.py` to change
+this list.
+
+**Daily goals** are the Leaderboard's weekly pace targets ÷ 5:
+**4 conversations** and **1 appointment set**.
+
+| Status | Rule | Color |
+| --- | --- | --- |
+| **Green** | 4+ conversations **and** 1+ appointment set | `#28a745` |
+| **Yellow** | 2-3 conversations; or the conversation goal was hit but no appointment was set; or 0-1 conversations with real outbound dial effort | `#ffc107` |
+| **Off** | 0-1 conversations with no offsetting dial effort (zero/near-zero activity) | `#dc3545` |
+
+Agents are grouped worst-first (Off → Yellow → Green) so problems surface at
+the top of the message. Colors are applied with the Chat-supported HTML
+subset (`<font color="...">`) inside the card, matching the hex codes above
+exactly.
+
+### Setup
+
+In addition to the `SHEET_ID` and `GOOGLE_SERVICE_ACCOUNT_JSON` secrets above,
+add one more repo secret:
+
+| Secret | Value |
+| --- | --- |
+| `FUB_CHAT_WEBHOOK_URL` | the Google Chat incoming webhook URL for the target space (Chat space → **Apps & integrations → Webhooks**) |
+
+The webhook URL contains a key/token, so it's kept out of the workflow file
+and read only from the secret at run time.
+
+```bash
+# manual test run, bypasses the 8pm-Eastern gate
+python sheets_sync/fub_daily_audit.py --force
+```
+
+The scheduled workflow fires at two UTC times (bracketing 8pm Eastern across
+DST, same trick as the sync workflow above); the script itself gates on the
+wall-clock Eastern hour, so exactly one of the two firings sends the report
+each day. `workflow_dispatch` always sends.
 
 ---
 
