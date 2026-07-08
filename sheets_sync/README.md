@@ -77,6 +77,7 @@ Repo → **Settings → Secrets and variables → Actions → New repository sec
 | `FUB_API_KEY` | your Follow Up Boss API key |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | the **entire contents** of the downloaded service-account JSON file (paste it raw) |
 | `SHEET_ID` | the spreadsheet ID from step 2 |
+| `GOOGLE_CHAT_WEBHOOK_URL` | the Google Chat incoming webhook URL for the **Daily FUB Activity Audit** report (see below) |
 
 *(Optional)* If you register an integration with FUB for higher rate limits,
 add `FUB_X_SYSTEM` and `FUB_X_SYSTEM_KEY` as secrets and wire them into the
@@ -177,8 +178,50 @@ common assumptions in the brief. **Please confirm the ones marked ⚠️.**
 
 ---
 
+---
+
+## Daily activity audit -> Google Chat
+
+`fub_daily_audit.py` reads yesterday's row (Eastern calendar day) for every
+agent out of the **Daily Activity** tab this sync maintains, scores each
+agent against the **daily goals** (weekly targets ÷ 5 = **4 conversations**
+and **1 appointment set**), and posts an HTML-color-coded card to a Google
+Chat incoming webhook. Runs automatically at **8:00pm America/New_York**,
+daily, via `.github/workflows/fub-daily-audit.yml`.
+
+**Excluded from the audit** (admin/leadership/lending, not dial-activity
+agents): Chad Leonberg, Brittany Leonberg, Dennis Palapar, Danielle Heitner.
+
+**Status thresholds:**
+
+| Status | Rule | Color |
+| --- | --- | --- |
+| Green | 4+ conversations **and** 1+ appointments set | `#28a745` |
+| Yellow | 2-3 conversations, or any outbound-dial effort short of the goal | `#ffc107` |
+| Off | 0-1 conversations and no outbound dial effort | `#dc3545` |
+
+Set up a Google Chat incoming webhook: target space → **Apps & integrations →
+Add webhook** → copy the URL → save it as the `GOOGLE_CHAT_WEBHOOK_URL` repo
+secret (step 4 above). The webhook URL contains an auth token, so it's kept
+as a secret rather than committed to the workflow file.
+
+```bash
+# ad-hoc run, defaults to auditing yesterday (Eastern)
+python sheets_sync/fub_daily_audit.py
+
+# audit a specific date
+python sheets_sync/fub_daily_audit.py --date 2026-07-07
+
+# bypass the 8pm-Eastern scheduling gate when testing locally
+python sheets_sync/fub_daily_audit.py --force
+```
+
+---
+
 ## Files
 
 - `fub_sheets_sync.py` — the sync (FUB client, config discovery, metrics, Sheets writer).
+- `fub_daily_audit.py` — reads the sheet and posts the color-coded daily agent audit to Google Chat.
 - `requirements.txt` — Python deps.
-- `../.github/workflows/fub-sheets-sync.yml` — the scheduled + manual workflow.
+- `../.github/workflows/fub-sheets-sync.yml` — the scheduled + manual sync workflow.
+- `../.github/workflows/fub-daily-audit.yml` — the scheduled + manual daily audit workflow.

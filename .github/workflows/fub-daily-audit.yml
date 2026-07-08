@@ -1,0 +1,55 @@
+name: FUB Daily Activity Audit
+
+# GitHub cron is UTC and Eastern shifts with daylight saving, so rather than do
+# cron math we fire twice near 8pm Eastern (covering both EST and EDT) and let
+# the script (maybe_gate_eastern_hour) proceed only when the wall-clock
+# Eastern hour is exactly 20 (8pm). The non-matching run each day is a ~5s
+# no-op. This is DST-proof, same technique as fub-sheets-sync.yml.
+on:
+  schedule:
+    - cron: "0 0 * * *"   # 8pm EST (UTC-5)
+    - cron: "0 1 * * *"   # 8pm EDT (UTC-4)
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Target date to audit (YYYY-MM-DD, Eastern). Defaults to yesterday."
+        required: false
+        type: string
+
+concurrency:
+  group: fub-daily-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: sheets_sync/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r sheets_sync/requirements.txt
+
+      - name: Run daily audit
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          # Exposes the trigger to the script so the Eastern-hour gate only
+          # applies to scheduled runs (manual dispatch always proceeds).
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          DATE="${{ github.event.inputs.date }}"
+          if [ -n "$DATE" ]; then
+            python sheets_sync/fub_daily_audit.py --date "$DATE" --force
+          else
+            python sheets_sync/fub_daily_audit.py
+          fi
