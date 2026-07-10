@@ -1,0 +1,61 @@
+name: FUB Daily Activity Audit
+
+# Fires at 8pm Eastern and posts a color-coded per-agent summary (Green /
+# Yellow / Off, based on daily goals derived from the Leaderboard's weekly
+# pace targets) to a Google Chat space. Reads the "Daily Activity" tab that
+# fub-sheets-sync.yml keeps up to date; never touches the FUB API or writes
+# to the sheet.
+#
+# GitHub cron is UTC and 8pm Eastern shifts with daylight saving, so (same
+# trick as fub-sheets-sync.yml) this fires at both UTC times that could be
+# 8pm ET and the script's maybe_gate_eastern_hour gates on the wall-clock
+# Eastern hour actually being 20 -- DST-proof, no cron math.
+on:
+  schedule:
+    - cron: "0 0 * * *"  # 8pm EDT
+    - cron: "0 1 * * *"  # 8pm EST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the report instead of posting to Google Chat"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: fub-daily-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: sheets_sync/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r sheets_sync/requirements.txt
+
+      - name: Run audit
+        working-directory: sheets_sync
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
+          # Exposes the trigger to the script so the 8pm-Eastern gate only
+          # applies to scheduled runs (manual dispatch always proceeds).
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="--dry-run"
+          fi
+          python fub_daily_audit.py $ARGS

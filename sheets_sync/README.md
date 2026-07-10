@@ -177,8 +177,46 @@ common assumptions in the brief. **Please confirm the ones marked ⚠️.**
 
 ---
 
+## Daily activity audit -> Google Chat
+
+`fub_daily_audit.py` reads yesterday's rows out of the **Daily Activity** tab
+(no FUB API calls, no sheet writes) and posts a color-coded per-agent summary
+to a Google Chat space, once a day at **8pm America/New_York** (same
+DST-proof gating trick as the sync: the workflow fires at both UTC times that
+could be 8pm ET and the script checks the wall-clock Eastern hour).
+
+- **Excluded from the audit:** Chad Leonberg, Brittany Leonberg, Dennis
+  Palapar, Danielle Heitner (admin, leadership, lending).
+- **Daily goals** = the Leaderboard's weekly pace targets ÷ 5 → **4
+  conversations** and **1 appointment set**.
+- **Status per agent:**
+  - 🟢 **Green** (`#28a745`) — 4+ conversations **and** 1+ appointments set.
+  - 🟡 **Yellow** (`#ffc107`) — 2–3 conversations, or made outbound dials
+    without hitting the conversation goal.
+  - 🔴 **Off** (`#dc3545`) — 0–1 conversations and no outbound dial effort.
+
+Add one more repo secret to enable it:
+
+| Secret | Value |
+| --- | --- |
+| `GOOGLE_CHAT_WEBHOOK_URL` | the Google Chat incoming-webhook URL for the target space (includes its own key/token query params — treat it as a secret, never commit it) |
+
+It reuses the existing `SHEET_ID` and `GOOGLE_SERVICE_ACCOUNT_JSON` secrets.
+
+```bash
+# print the report instead of posting it (no GOOGLE_CHAT_WEBHOOK_URL needed)
+python sheets_sync/fub_daily_audit.py --dry-run
+
+# bypass the 8pm-Eastern gate when testing a scheduled-style run locally
+python sheets_sync/fub_daily_audit.py --force
+```
+
+---
+
 ## Files
 
 - `fub_sheets_sync.py` — the sync (FUB client, config discovery, metrics, Sheets writer).
+- `fub_daily_audit.py` — reads the sheet and posts the daily Green/Yellow/Off audit to Google Chat.
 - `requirements.txt` — Python deps.
-- `../.github/workflows/fub-sheets-sync.yml` — the scheduled + manual workflow.
+- `../.github/workflows/fub-sheets-sync.yml` — the scheduled + manual sync workflow.
+- `../.github/workflows/fub-daily-audit.yml` — the scheduled + manual audit workflow.
